@@ -23,54 +23,56 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install ViGEmBus driver
+      # vgamepad's setup.py does `import vgamepad` to read the version,
+      # which calls ctypes.WinDLL("ViGEmClient") at module init.
+      # Without the real driver, this hangs forever.
+      # Fix: drop a dummy ViGEmClient.dll with empty exported functions
+      # into System32. setup.py only needs the DLL to load, not to work.
+      # The real driver is only required at RUNTIME on the user's machine.
+      - name: Place dummy ViGEmClient.dll for build
         shell: pwsh
         run: |
-          Write-Host "Downloading ViGEmBus v1.22.0..."
-          Invoke-WebRequest -Uri "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe" -OutFile "$env:TEMP\VigemBus.exe"
-          Write-Host "Installing silently (may require admin)..."
-          try {
-              $proc = Start-Process -FilePath "$env:TEMP\VigemBus.exe" -ArgumentList "/S" -Wait -PassThru -NoNewWindow
-              if ($proc.ExitCode -eq 0) {
-                  Write-Host "ViGEmBus install completed (exit code 0)."
-              } else {
-                  Write-Host "ViGEmBus install exited with code $($proc.ExitCode)."
-              }
-          } catch {
-              Write-Host "Warning: ViGEmBus install failed: $_"
+          Write-Host "Checking for gcc (MinGW)..."
+          $gccPath = Get-Command gcc -ErrorAction SilentlyContinue
+          if (-not $gccPath) {
+              throw "gcc not found on PATH. windows-latest runner should have MinGW gcc pre-installed."
           }
-          # Give the kernel driver a few seconds to register if installed
-          Start-Sleep -Seconds 5
+          Write-Host "gcc found at: $($gccPath.Source)"
+
+          $stub = @"
+          // Dummy ViGEmClient.dll - empty exports to satisfy vgamepad import at build time.
+          // The real ViGEmBus driver must be installed by the user before running the EXE.
+          __declspec(dllexport) void* ViGEmAlloc(void) { return (void*)0; }
+          __declspec(dllexport) void  ViGEmFree(void* p) {}
+          __declspec(dllexport) int   ViGEmConnect(void* p) { return 0; }
+          __declspec(dllexport) void  ViGEmDisconnect(void* p) {}
+          __declspec(dllexport) void* ViGEmTargetX360Alloc(void* p) { return (void*)0; }
+          __declspec(dllexport) void* ViGEmTargetDS4Alloc(void* p) { return (void*)0; }
+          __declspec(dllexport) void  ViGEmTargetFree(void* p, void* t) {}
+          __declspec(dllexport) int   ViGEmTargetAdd(void* p, void* t) { return 0; }
+          __declspec(dllexport) int   ViGEmTargetRemove(void* p, void* t) { return 0; }
+          __declspec(dllexport) int   ViGEmTargetX360Update(void* p, void* t, int s) { return 0; }
+          __declspec(dllexport) int   ViGEmTargetDS4Update(void* p, void* t, int s) { return 0; }
+          __declspec(dllexport) int   ViGEmTargetX360RegisterNotification(void* p, void* t, void* c, void* d) { return 0; }
+          __declspec(dllexport) int   ViGEmTargetDS4RegisterNotification(void* p, void* t, void* c, void* d) { return 0; }
+          __declspec(dllexport) int   ViGEmTargetX360UnregisterNotification(void* t) { return 0; }
+          __declspec(dllexport) int   ViGEmTargetDS4UnregisterNotification(void* t) { return 0; }
+          "@
+          Set-Content -Path "$env:TEMP\ViGEmClient_stub.c" -Value $stub
+          gcc -shared -o "$env:TEMP\ViGEmClient.dll" "$env:TEMP\ViGEmClient_stub.c"
+          if (-not (Test-Path "$env:TEMP\ViGEmClient.dll")) {
+              throw "Failed to compile dummy ViGEmClient.dll."
+          }
+          Copy-Item "$env:TEMP\ViGEmClient.dll" "C:\Windows\System32\ViGEmClient.dll" -Force
+          Write-Host "Dummy ViGEmClient.dll placed in System32 (size: $((Get-Item 'C:\Windows\System32\ViGEmClient.dll').Length) bytes)."
 
       - name: Install dependencies
-        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          # Install non-driver deps first so they're cached
-          pip install pygame pyinstaller
-          # Install vgamepad with --no-build-isolation to reuse the system env
-          # where ViGEmBus was just installed. Timeout after 2 min if it hangs.
-          try {
-              $job = Start-Job -ScriptBlock {
-                  pip install vgamepad --no-build-isolation 2>&1
-              }
-              $result = Wait-Job $job -Timeout 120
-              if ($null -eq $result) {
-                  Write-Host "WARNING: pip install vgamepad timed out after 2 minutes."
-                  Write-Host "ViGEmBus driver is likely not active in this CI environment."
-                  Write-Host "Stopping the hung job..."
-                  Stop-Job $job
-                  Remove-Job $job
-                  throw "vgamepad install timed out — see README for local build instructions."
-              } else {
-                  Receive-Job $job
-                  Remove-Job $job
-                  Write-Host "vgamepad installed successfully."
-              }
-          } catch {
-              Write-Host "ERROR: $_"
-              throw
-          }
+          pip install pygame pyinstaller setuptools wheel
+          # --no-build-isolation: reuse system env where dummy ViGEmClient.dll is in System32.
+          # This prevents pip from spawning a fresh env that can't see our DLL.
+          pip install vgamepad --no-build-isolation
         timeout-minutes: 5
 
       - name: Build EXE with PyInstaller
