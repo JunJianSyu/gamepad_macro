@@ -34,7 +34,7 @@ Required for creating virtual controllers.
 
 **Download:** https://github.com/nefarius/ViGEmBus/releases
 
-Run `ViGEmBus_Setup_x64.msi` and **reboot**.
+Run `ViGEmBus_1.22.0_x64_x86_arm64.exe` and **reboot**.
 
 ### 2. Install Python packages
 
@@ -62,16 +62,16 @@ All bindings are defined in `config.json` (auto-created next to the script):
 {
   "bindings": [
     {
-      "name": "Combo 1",
-      "trigger_button": null,
-      "sequence": ["X", "A", "RB", "LB", "RT", "LT"],
+      "name": "LT Combo",
+      "trigger": "LT",
+      "sequence": ["X", "Y", "LB", "RB", "RT"],
       "interval_ms": 70,
       "press_duration_ms": 40,
       "cooldown_ms": 350
     },
     {
       "name": "Dodge + Attack",
-      "trigger_button": 5,
+      "trigger": "RB",
       "sequence": ["B", "A", "A", "X"],
       "interval_ms": 50,
       "press_duration_ms": 30,
@@ -86,7 +86,7 @@ All bindings are defined in `config.json` (auto-created next to the script):
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Display name in GUI |
-| `trigger_button` | int/null | pygame button index, set via GUI or manually |
+| `trigger` | string/null | Button or trigger name, e.g. `"LT"`, `"RB"`, `"A"`. Set via GUI or manually |
 | `sequence` | array | Button names to play in order |
 | `interval_ms` | int | Delay between each button in sequence (default: 70) |
 | `press_duration_ms` | int | How long each button is held (default: 40) |
@@ -140,9 +140,14 @@ The workflow builds `GamepadMacro.exe` with PyInstaller and creates a GitHub Rel
 
 You can also trigger it manually from the **Actions** tab.
 
+**CI limitation:** `vgamepad`'s `setup.py` imports the package to read its version, which triggers ViGEmBus driver initialization. The workflow attempts a silent driver install, but the kernel driver may not activate without a reboot (which GHA runners can't do). If the build hangs at `Preparing metadata (pyproject.toml)`, build locally on a machine with ViGEmBus installed.
+
 ## Build locally
 
+The most reliable build method — your machine has the ViGEmBus driver properly loaded.
+
 ```bash
+pip install -r requirements.txt
 pip install pyinstaller
 pyinstaller --onefile --windowed --name GamepadMacro gamepad_macro.py
 ```
@@ -158,3 +163,4 @@ Output: `dist/GamepadMacro.exe` — copy `config.json` next to it.
 | Game ignores virtual controller | Run as Administrator |
 | Macro too fast/slow | Adjust `interval_ms` and `press_duration_ms` in config |
 | Macro fires multiple times | Increase `cooldown_ms` for that binding |
+| GHA build hangs at `Preparing metadata` | Build locally (see above). `vgamepad` requires an active ViGEmBus driver during `pip install` |
