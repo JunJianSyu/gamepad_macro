@@ -23,11 +23,55 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Install ViGEmBus driver
+        shell: pwsh
+        run: |
+          Write-Host "Downloading ViGEmBus v1.22.0..."
+          Invoke-WebRequest -Uri "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe" -OutFile "$env:TEMP\VigemBus.exe"
+          Write-Host "Installing silently (may require admin)..."
+          try {
+              $proc = Start-Process -FilePath "$env:TEMP\VigemBus.exe" -ArgumentList "/S" -Wait -PassThru -NoNewWindow
+              if ($proc.ExitCode -eq 0) {
+                  Write-Host "ViGEmBus install completed (exit code 0)."
+              } else {
+                  Write-Host "ViGEmBus install exited with code $($proc.ExitCode)."
+              }
+          } catch {
+              Write-Host "Warning: ViGEmBus install failed: $_"
+          }
+          # Give the kernel driver a few seconds to register if installed
+          Start-Sleep -Seconds 5
+
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          # Install non-driver deps first so they're cached
+          pip install pygame pyinstaller
+          # Install vgamepad with --no-build-isolation to reuse the system env
+          # where ViGEmBus was just installed. Timeout after 2 min if it hangs.
+          try {
+              $job = Start-Job -ScriptBlock {
+                  pip install vgamepad --no-build-isolation 2>&1
+              }
+              $result = Wait-Job $job -Timeout 120
+              if ($null -eq $result) {
+                  Write-Host "WARNING: pip install vgamepad timed out after 2 minutes."
+                  Write-Host "ViGEmBus driver is likely not active in this CI environment."
+                  Write-Host "Stopping the hung job..."
+                  Stop-Job $job
+                  Remove-Job $job
+                  throw "vgamepad install timed out — see README for local build instructions."
+              } else {
+                  Receive-Job $job
+                  Remove-Job $job
+                  Write-Host "vgamepad installed successfully."
+              }
+          } catch {
+              Write-Host "ERROR: $_"
+              throw
+          }
+        timeout-minutes: 5
 
       - name: Build EXE with PyInstaller
         run: |
