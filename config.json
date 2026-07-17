@@ -1,0 +1,12 @@
+{
+  "bindings": [
+    {
+      "name": "LT Combo",
+      "trigger": "LT",
+      "sequence": ["X", "Y", "LB", "RB", "RT"],
+      "interval_ms": 70,
+      "press_duration_ms": 40,
+      "cooldown_ms": 350
+    }
+  ]
+}
