@@ -23,57 +23,76 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # vgamepad's setup.py does `import vgamepad` to read the version,
-      # which calls ctypes.WinDLL("ViGEmClient") at module init.
-      # Without the real driver, this hangs forever.
-      # Fix: drop a dummy ViGEmClient.dll with empty exported functions
-      # into System32. setup.py only needs the DLL to load, not to work.
-      # The real driver is only required at RUNTIME on the user's machine.
-      - name: Place dummy ViGEmClient.dll for build
+      # vgamepad's setup.py does `import vgamepad` to read its version,
+      # which loads ViGEmClient.dll via ctypes. This hangs on any machine
+      # without the ViGEmBus kernel driver installed.
+      #
+      # Solution: skip pip install vgamepad entirely. Download the source
+      # tarball from GitHub, extract it, and copy the vgamepad/ package
+      # directly into Python's site-packages. setup.py is NEVER executed,
+      # so no driver is needed at build time. The user installs ViGEmBus
+      # before running the EXE.
+      - name: Install vgamepad manually (skip setup.py)
         shell: pwsh
         run: |
-          Write-Host "Checking for gcc (MinGW)..."
-          $gccPath = Get-Command gcc -ErrorAction SilentlyContinue
-          if (-not $gccPath) {
-              throw "gcc not found on PATH. windows-latest runner should have MinGW gcc pre-installed."
-          }
-          Write-Host "gcc found at: $($gccPath.Source)"
-
-          $stub = @"
-          // Dummy ViGEmClient.dll - empty exports to satisfy vgamepad import at build time.
-          // The real ViGEmBus driver must be installed by the user before running the EXE.
-          __declspec(dllexport) void* ViGEmAlloc(void) { return (void*)0; }
-          __declspec(dllexport) void  ViGEmFree(void* p) {}
-          __declspec(dllexport) int   ViGEmConnect(void* p) { return 0; }
-          __declspec(dllexport) void  ViGEmDisconnect(void* p) {}
-          __declspec(dllexport) void* ViGEmTargetX360Alloc(void* p) { return (void*)0; }
-          __declspec(dllexport) void* ViGEmTargetDS4Alloc(void* p) { return (void*)0; }
-          __declspec(dllexport) void  ViGEmTargetFree(void* p, void* t) {}
-          __declspec(dllexport) int   ViGEmTargetAdd(void* p, void* t) { return 0; }
-          __declspec(dllexport) int   ViGEmTargetRemove(void* p, void* t) { return 0; }
-          __declspec(dllexport) int   ViGEmTargetX360Update(void* p, void* t, int s) { return 0; }
-          __declspec(dllexport) int   ViGEmTargetDS4Update(void* p, void* t, int s) { return 0; }
-          __declspec(dllexport) int   ViGEmTargetX360RegisterNotification(void* p, void* t, void* c, void* d) { return 0; }
-          __declspec(dllexport) int   ViGEmTargetDS4RegisterNotification(void* p, void* t, void* c, void* d) { return 0; }
-          __declspec(dllexport) int   ViGEmTargetX360UnregisterNotification(void* t) { return 0; }
-          __declspec(dllexport) int   ViGEmTargetDS4UnregisterNotification(void* t) { return 0; }
-          "@
-          Set-Content -Path "$env:TEMP\ViGEmClient_stub.c" -Value $stub
-          gcc -shared -o "$env:TEMP\ViGEmClient.dll" "$env:TEMP\ViGEmClient_stub.c"
-          if (-not (Test-Path "$env:TEMP\ViGEmClient.dll")) {
-              throw "Failed to compile dummy ViGEmClient.dll."
-          }
-          Copy-Item "$env:TEMP\ViGEmClient.dll" "C:\Windows\System32\ViGEmClient.dll" -Force
-          Write-Host "Dummy ViGEmClient.dll placed in System32 (size: $((Get-Item 'C:\Windows\System32\ViGEmClient.dll').Length) bytes)."
-
-      - name: Install dependencies
-        run: |
           python -m pip install --upgrade pip
-          pip install pygame pyinstaller setuptools wheel
-          # --no-build-isolation: reuse system env where dummy ViGEmClient.dll is in System32.
-          # This prevents pip from spawning a fresh env that can't see our DLL.
-          pip install vgamepad --no-build-isolation
-        timeout-minutes: 5
+          pip install pygame pyinstaller
+
+          # Download vgamepad source tarball from GitHub
+          $vgamepadVersion = "0.1.0"
+          $tarballUrl = "https://github.com/yannbouteiller/vgamepad/archive/refs/tags/v$vgamepadVersion.tar.gz"
+          Write-Host "Downloading vgamepad v$vgamepadVersion from GitHub..."
+          Invoke-WebRequest -Uri $tarballUrl -OutFile "$env:TEMP\vgamepad.tar.gz"
+
+          # Extract
+          Write-Host "Extracting..."
+          tar -xzf "$env:TEMP\vgamepad.tar.gz" -C "$env:TEMP"
+
+          # Find the extracted directory
+          $extractedDir = Get-ChildItem "$env:TEMP\vgamepad-*" -Directory | Select-Object -First 1
+          if (-not $extractedDir) {
+              throw "Could not find extracted vgamepad directory."
+          }
+          Write-Host "Extracted to: $($extractedDir.FullName)"
+
+          # Find Python's site-packages directory
+          $sitePackages = python -c "import site; print(site.getsitepackages()[0])"
+          Write-Host "Python site-packages: $sitePackages"
+
+          # Copy the vgamepad/ package into site-packages
+          Copy-Item "$($extractedDir.FullName)\vgamepad" -Destination $sitePackages -Recurse -Force
+          Write-Host "vgamepad package copied to site-packages."
+
+          # Patch virtual_gamepad.py: the REAL culprit is a module-level
+          # VBUS = VBus() line. VBus.__init__ calls vigem_alloc() + vigem_connect()
+          # which loads ViGEmClient.dll and hangs without the driver.
+          #
+          # Fix: replace eager VBus creation with None, and patch VGamepad.__init__
+          # to lazily create VBUS on first use. At runtime, the user has the real
+          # ViGEmBus driver installed, so it works normally.
+          $vgPath = Join-Path $sitePackages "vgamepad\win\virtual_gamepad.py"
+          $vgContent = Get-Content $vgPath -Raw
+
+          # 1. Defer global VBus creation
+          $vgContent = $vgContent -replace 'VBUS\s*=\s*VBus\(\)', 'VBUS = None  # deferred: created lazily in VGamepad.__init__'
+
+          # 2. Make VGamepad.__init__ create VBUS on first use
+          $LF = "`n"
+          $oldInit = "class VGamepad(ABC):${LF}    def __init__(self):${LF}        self.vbus = VBUS"
+          $newInit = "class VGamepad(ABC):${LF}    def __init__(self):${LF}        global VBUS${LF}        if VBUS is None:${LF}            VBUS = VBus()${LF}        self.vbus = VBUS"
+          $vgContent = $vgContent -replace [regex]::Escape($oldInit), $newInit
+
+          [System.IO.File]::WriteAllText($vgPath, $vgContent)
+          Write-Host "Patched virtual_gamepad.py: VBUS deferred, VGamepad.__init__ does lazy creation."
+
+          # Verify import works (should NOT load ViGEmClient.dll now)
+          python -c "import vgamepad; print('vgamepad imported OK')"
+          $patchedContent = Get-Content $vgPath -Raw
+          if ($patchedContent -match 'VBUS\s*=\s*None') {
+              Write-Host "Patch verified: VBUS = None found in virtual_gamepad.py"
+          } else {
+              Write-Host "WARNING: patch may not have applied correctly."
+          }
 
       - name: Build EXE with PyInstaller
         run: |
